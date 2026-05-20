@@ -1,0 +1,14 @@
+# Identical to sample_perez_luna.toml except method = "dpmpp_2s".
+# Used for head-to-head comparison against the midpoint baseline.
+num_samples = 32
+batch_size = 256
+num_steps = 512
+
+model_type = "ema"
+out_dir = "samples/dpmpp_2s_512"
+replace_samples = true
+step_scale = 1.00
+method = "dpmpp_2s"
+
+observation = "experimental_methods/perez_luna/observation.toml"
+unconditional_data_dir = "data/batch_3/normalized_test_large"

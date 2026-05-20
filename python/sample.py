@@ -30,7 +30,7 @@ parser.add_argument("--test-dir", type=Path)
 
 DEVICE = torch.device("cpu")
 
-ODEMethod = Literal["euler", "heun", "midpoint"]
+ODEMethod = Literal["euler", "heun", "midpoint", "dpmpp_2s"]
 
 def build_observation(dataset, observations, param_vec=None, default_stddev=1.0):
     _, data_params, data_tensor = dataset[0]
@@ -184,6 +184,67 @@ def reverse_step(
     x_t = x_t.detach()
     x_t.requires_grad = True
     denoiser.zero_grad()
+
+    # =====================================================
+    # DPM-Solver++(2S) branch — early-return implementation
+    # =====================================================
+    # Reference: Lu et al. 2022b, "DPM-Solver++: Fast Solver for Guided
+    # Sampling of Diffusion Probabilistic Models" (arXiv:2211.01095).
+    #
+    # Reformulates the EDM probability-flow ODE in lambda = -log(sigma) space,
+    # where it becomes a linear ODE solvable in closed form for piecewise-
+    # constant or piecewise-linear data-prediction model D_theta. The single-
+    # step second-order variant (2S) uses 2 NFE per step (matching midpoint)
+    # but stays bounded as sigma->0, making it stable for high-strength
+    # guided sampling.
+    #
+    # For EDM noise schedule (alpha=1, sigma=t) with r=1/2:
+    #   beta  = sqrt(t/t_prev)  = exp(-h/2)            contraction in predictor
+    #   gamma = t/t_prev        = exp(-h)              contraction in corrector
+    #   t_s   = sqrt(t_prev*t)                         geometric midpoint of sigma
+    #   u     = beta*x_t + (1-beta)*D_theta(x_t, t_prev)        predictor
+    #   x_n   = gamma*x_t + (1-gamma)*D_theta(u, t_s)           corrector
+    if method == "dpmpp_2s":
+        # (2S) is derived for the unscaled probability-flow ODE (step_scale=1).
+        # Other values would require a custom rederivation.
+        assert step_scale == 1.0, (
+            f"dpmpp_2s requires step_scale=1.0, got {step_scale}"
+        )
+
+        # First NFE: data prediction at the current state and time.
+        x_denoised = denoiser(x_t, t_prev * ones, **model_args)
+
+        # Predictor: interpolate from x_t toward D_1 using lambda-space coeffs.
+        beta = (t / t_prev) ** 0.5
+        u = beta * x_t + (1 - beta) * x_denoised
+
+        # Geometric midpoint of sigma is the midpoint in lambda. When t==0 (the
+        # very last sampling step) this collapses to 0, which is a singularity
+        # for the denoiser's log(sigma) preconditioning. Clamp only the *eval*
+        # noise level; keep beta/gamma at their true values so the asymptotic
+        # behavior x_n -> D_theta(u, ~0) is preserved.
+        t_s = (t_prev * t) ** 0.5
+        if isinstance(t_s, torch.Tensor):
+            t_s_eval = torch.clamp(t_s, min=1e-3)
+        else:
+            t_s_eval = max(t_s, 1e-3)
+
+        # Second NFE: data prediction at the predicted state and midpoint time.
+        x_denoised = denoiser(u, t_s_eval * ones, **model_args)
+
+        # Corrector: interpolate from x_t toward D_2 using lambda-space coeffs.
+        gamma = t / t_prev
+        x_pred = gamma * x_t + (1 - gamma) * x_denoised
+
+        # const_guidance correction -- identical handling to the midpoint path
+        # below. x_denoised here is D_2; the gradient chain x_t -> D_1 -> u
+        # -> D_2 is preserved by autograd, so guidance_score() works the same
+        # way it does for midpoint.
+        if use_const_guidance and observation["var"] is not None and t_mid < t_max_guidance:
+            obs_score = guidance_score(x_t, x_denoised, observation, proc_var(t_mid))
+            x_pred = x_pred + obs_score
+
+        return x_pred.detach()
 
     # Compute initial step to get predicted sample location
     x_denoised = denoiser(x_t, t_prev * ones, **model_args)
