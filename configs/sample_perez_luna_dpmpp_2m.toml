@@ -1,0 +1,17 @@
+# Mirrors sample_perez_luna.toml with method = "dpmpp_2m".
+# (2M) is the multistep DPM-Solver++ variant: 1 NFE per step plus a cached
+# denoiser output from the previous step. Requires S_churn=0 (which is the
+# current default in sample.py) for math correctness; with stochastic noise
+# injection the previous-step cache no longer lies on the new trajectory.
+num_samples = 32
+batch_size = 256
+num_steps = 512
+
+model_type = "ema"
+out_dir = "samples/dpmpp_2m_512"
+replace_samples = true
+step_scale = 1.00
+method = "dpmpp_2m"
+
+observation = "experimental_methods/perez_luna/observation.toml"
+unconditional_data_dir = "data/batch_3/normalized_test_large"

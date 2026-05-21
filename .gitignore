@@ -15,3 +15,5 @@ anom.png
 *.tar.gz
 checkpoints/
 *.pth.tar
+.DS_Store
+**/.DS_Store

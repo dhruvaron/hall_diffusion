@@ -30,7 +30,7 @@ parser.add_argument("--test-dir", type=Path)
 
 DEVICE = torch.device("cpu")
 
-ODEMethod = Literal["euler", "heun", "midpoint", "dpmpp_2s"]
+ODEMethod = Literal["euler", "heun", "midpoint", "dpmpp_2s", "dpmpp_2m"]
 
 def build_observation(dataset, observations, param_vec=None, default_stddev=1.0):
     _, data_params, data_tensor = dataset[0]
@@ -162,6 +162,8 @@ def reverse_step(
     step_scale=1.0,
     method: ODEMethod="midpoint",
     model_args=dict(),
+    prev_denoised=None,    # multistep cache: D_theta from the previous step
+    t_prev_prev=None,      # multistep cache: t_prev used one step ago
 ):
     (b, _, _) = x_t.shape
 
@@ -214,6 +216,16 @@ def reverse_step(
         # First NFE: data prediction at the current state and time.
         x_denoised = denoiser(x_t, t_prev * ones, **model_args)
 
+        # Static thresholding (Lu et al. 2022b, Sec. 4.2 / Imagen-style):
+        # Clip the data prediction x_theta to the training-data range to
+        # prevent the late-step contracting update from inheriting model
+        # excursions outside physical scale. c = 2.0 = 4 * data_std, which
+        # preserves ~99.99% of legitimate values under the trained N(0, 0.5)
+        # marginal. Without this, the corrector x_pred = gamma*x_t + (1-gamma)*D
+        # converges to whatever D the model predicts -- including out-of-range
+        # values -- as gamma -> 0 at the final step.
+        x_denoised = torch.clamp(x_denoised, min=-2.0, max=2.0)
+
         # Predictor: interpolate from x_t toward D_1 using lambda-space coeffs.
         beta = (t / t_prev) ** 0.5
         u = beta * x_t + (1 - beta) * x_denoised
@@ -232,6 +244,14 @@ def reverse_step(
         # Second NFE: data prediction at the predicted state and midpoint time.
         x_denoised = denoiser(u, t_s_eval * ones, **model_args)
 
+        # Static thresholding -- same rationale as the D_1 clamp above. This
+        # value flows into BOTH the corrector formula and the const_guidance
+        # gradient below, so clamping here also bounds how far the guidance
+        # correction can push x_pred per step. torch.clamp has well-defined
+        # gradients (identity inside range, zero outside), so the autograd
+        # chain for guidance_score() remains valid.
+        x_denoised = torch.clamp(x_denoised, min=-2.0, max=2.0)
+
         # Corrector: interpolate from x_t toward D_2 using lambda-space coeffs.
         gamma = t / t_prev
         x_pred = gamma * x_t + (1 - gamma) * x_denoised
@@ -244,7 +264,82 @@ def reverse_step(
             obs_score = guidance_score(x_t, x_denoised, observation, proc_var(t_mid))
             x_pred = x_pred + obs_score
 
-        return x_pred.detach()
+        # (2S) doesn't need cross-step state; return None for the cache slot.
+        return x_pred.detach(), None
+
+    # =====================================================
+    # DPM-Solver++(2M) branch -- multistep, early-return implementation
+    # =====================================================
+    # Reference: Lu et al. 2022b, Algorithm 2 (arXiv:2211.01095). Uses 1 NFE
+    # per step PLUS a cached denoiser output from the previous step to reach
+    # second-order accuracy at half the per-step compute of (2S) or midpoint.
+    #
+    # For EDM noise schedule (alpha=1, sigma=t), with h_i = log(t_{i-1}/t_i)
+    # and r_i = h_{i-1}/h_i:
+    #   D_extrap = (1 + 1/(2 r_i)) * D_curr - (1/(2 r_i)) * D_prev_cached
+    #   x_new    = gamma * x_t + (1 - gamma) * D_extrap   (same corrector shape as 2S)
+    #
+    # Requires deterministic sampling (S_churn=0) for math correctness; with
+    # stochastic injection, the cache from the previous step no longer lies on
+    # the trajectory we are now on. Marks's default is S_churn=0 so this is
+    # the expected operating regime.
+    #
+    # First-step fallback: no cache yet -> use first-order DPM-Solver++(1),
+    # i.e. D_extrap = D_curr. Same fallback for the last step (t close to 0)
+    # because h_curr -> infinity and the extrapolation coefficients blow up.
+    if method == "dpmpp_2m":
+        assert step_scale == 1.0, (
+            f"dpmpp_2m requires step_scale=1.0, got {step_scale}"
+        )
+
+        # First (and only) NFE
+        x_denoised = denoiser(x_t, t_prev * ones, **model_args)
+
+        # Static thresholding (same as 2S branch above for consistency).
+        x_denoised = torch.clamp(x_denoised, min=-2.0, max=2.0)
+
+        gamma = t / t_prev
+
+        # Decide whether we have enough history AND well-defined math for the
+        # second-order extrapolation. Otherwise fall back to first-order.
+        t_curr_f = float(t) if torch.is_tensor(t) else float(t)
+        can_use_2m = (
+            prev_denoised is not None
+            and t_prev_prev is not None
+            and t_curr_f > 1e-3
+        )
+
+        if can_use_2m:
+            import math
+            t_prev_f = float(t_prev) if torch.is_tensor(t_prev) else float(t_prev)
+            t_prev_prev_f = (
+                float(t_prev_prev) if torch.is_tensor(t_prev_prev)
+                else float(t_prev_prev)
+            )
+            h_curr = math.log(t_prev_f / t_curr_f)
+            h_prev = math.log(t_prev_prev_f / t_prev_f)
+            r = h_prev / h_curr
+            coef = 1.0 / (2.0 * r)
+            # prev_denoised is already detached (set by reverse() from a prior
+            # .detach()-ed return), so the autograd graph from x_t flows only
+            # through the (1 + coef) * x_denoised term -- correct gradient
+            # behavior for guidance_score() below.
+            D_used = (1.0 + coef) * x_denoised - coef * prev_denoised
+        else:
+            # First step (no cache) or last step (t -> 0): first-order update.
+            D_used = x_denoised
+
+        # Corrector update (same shape as 2S, but D_used is an extrapolation
+        # rather than a fresh denoiser eval at the midpoint).
+        x_pred = gamma * x_t + (1 - gamma) * D_used
+
+        # const_guidance correction -- identical handling to (2S) and midpoint.
+        if use_const_guidance and observation["var"] is not None and t_mid < t_max_guidance:
+            obs_score = guidance_score(x_t, D_used, observation, proc_var(t_mid))
+            x_pred = x_pred + obs_score
+
+        # Return current denoiser output for the next step's cache.
+        return x_pred.detach(), x_denoised.detach()
 
     # Compute initial step to get predicted sample location
     x_denoised = denoiser(x_t, t_prev * ones, **model_args)
@@ -289,7 +384,8 @@ def reverse_step(
         obs_score = guidance_score(x_t, x_denoised, observation, proc_var(t_mid))
         x_pred += obs_score
 
-    return x_pred.detach()
+    # midpoint/heun/euler don't need cross-step state; return None for the cache slot.
+    return x_pred.detach(), None
 
 def reverse(
     denoiser,
@@ -321,6 +417,12 @@ def reverse(
     output = torch.zeros((num_steps, b, c, w))
     output[0, ...] = x
 
+    # Multistep state: cached denoiser output and t_prev from the previous
+    # iteration. Used only by method='dpmpp_2m'; other methods read None
+    # and ignore them.
+    prev_denoised = None
+    prev_t_prev = None
+
     for step_idx, t in enumerate(pbar := tqdm(timesteps, disable=(not showprogress))):
         if step_idx == 0:
             continue
@@ -343,15 +445,24 @@ def reverse(
 
         pbar.set_description(f"Noise level: {t_new:.4f}, Gamma: {gamma:.4f}")
 
-        x = reverse_step(
+        x, current_denoised = reverse_step(
             denoiser,
             x + noise,
-            t_new, 
+            t_new,
             t,
             observation,
             model_args=model_args,
+            prev_denoised=prev_denoised,
+            t_prev_prev=prev_t_prev,
             **kwargs,
         )
+
+        # Update multistep state for the next iteration. For non-multistep
+        # methods, current_denoised is None, so prev_denoised stays None and
+        # any later (2M) call would correctly fall back to first-order on
+        # the very first step.
+        prev_denoised = current_denoised
+        prev_t_prev = t_new  # the noise level the denoiser was actually called at
 
         # Check for NaN or Inf
         if not torch.all(torch.isfinite(x)):
@@ -368,11 +479,11 @@ def sample(model, noise_sampler, num_samples, args):
     # Load sampling arguments
     num_steps = args.get("num_steps", 256)
     noise_min = args.get("noise_min", 0.002)
-    noise_max = args.get("noise_max", 20)
+    noise_max = args.get("noise_max", 80)
     exponent = args.get("step_exponent", 7)
     step_scale = args.get("step_scale", 1.0)
     method = args.get("method", "midpoint")
-    S_churn = args.get("S_churn", 40)
+    S_churn = args.get("S_churn", 0)
     refinement_steps = args.get("refinement_steps", 0)
 
     # Determine if we're doing condional or unconditional sampling

@@ -3,7 +3,7 @@ num_samples = 32
 # Batch size of sample generation. If not provided, we do a single batch
 batch_size = 256
 # Number of sampling steps to take
-num_steps = 1024
+num_steps = 256
 
 # Which model to load (ema, best, last) 
 model_type = "ema"
@@ -18,7 +18,7 @@ method = "midpoint"
 
 [observation]
 base_sim = "mcmc_reference/ref_3charge/normalized"
-stddev = 0.01
+stddev = 1.0
 
 [observation.fields]
 B = {locs = "all", error_type = "relative"}

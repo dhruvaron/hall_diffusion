@@ -75,7 +75,7 @@ class ThrusterDataset(Dataset):
         return len(self.files)
 
     def __getitem__(self, idx):
-        data = np.load(self.data_dir / self.files[idx])
+        data = np.load(self.data_dir / self.files[idx], allow_pickle=True)
 
         tensor = data["data"]
         params = data["params"]

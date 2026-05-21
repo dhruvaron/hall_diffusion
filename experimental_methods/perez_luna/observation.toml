@@ -14,4 +14,4 @@ y = [508.7719298245599, 2824.5614035087706, 7315.789473684209, 10543.85964912280
 normalized = false
 locs="all"
 error_type="relative"
-stddev=0.01
+stddev=1
